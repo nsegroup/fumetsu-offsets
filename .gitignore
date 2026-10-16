@@ -1,0 +1,10 @@
+# NEVER commit the signing private key. It lives only as the GitHub Actions
+# secret OFFSET_SIGNING_KEY.
+*.LOCAL-ONLY
+signing_private*
+cs2/
+dump/
+dumper/
+payload.json
+*.dll
+__pycache__/

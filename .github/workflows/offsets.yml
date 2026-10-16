@@ -1,0 +1,128 @@
+name: cs2-offsets
+
+# Fully cloud. No dev PC. Polls CS2's public depot; on a new build it downloads
+# the DLLs anonymously, dumps offsets offline (no running game), signs and
+# publishes. See PLAN.md.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 min
+  workflow_dispatch: {}       # manual run / first validation
+
+concurrency:
+  group: cs2-offsets
+  cancel-in-progress: false
+
+permissions:
+  contents: write             # commit offsets/ back to the repo
+  issues: write               # open an issue if a dump fails
+
+jobs:
+  offsets:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+
+      # 1) New build?
+      - name: Check CS2 build
+        id: build
+        run: python scripts/check_build.py
+
+      - name: Up to date
+        if: steps.build.outputs.new == ''
+        run: echo "no new build; nothing to do"
+
+      # 2) Download the DLLs anonymously (app 730 allows anonymous).
+      - name: Download CS2 binaries (DepotDownloader, anonymous)
+        if: steps.build.outputs.new != ''
+        shell: pwsh
+        run: |
+          dotnet tool install --global DepotDownloader
+          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
+          # CS2 win64 binaries + version file live in depot 2347770.
+          @'
+          regex:game/csgo/bin/win64/client.dll
+          regex:game/csgo/bin/win64/engine2.dll
+          regex:game/csgo/steam.inf
+          '@ | Out-File -Encoding ascii filelist.txt
+          depotdownloader -app 730 -depot 2347770 -filelist filelist.txt `
+            -dir cs2 -username anonymous
+
+      # 3) Offline dump (no running game). cs2-dumper offline analyzer reads the
+      #    on-disk DLLs: schema classes + module globals + buttons + info.json.
+      #    Fail-closed: make_offsets.py exits non-zero if required offsets are
+      #    missing, so a bad dump is never signed.
+      - name: Dump offsets offline
+        if: steps.build.outputs.new != ''
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/a2x/cs2-dumper dumper
+          # Offline/file mode against the downloaded modules -> dump/ with the
+          # .hpp + info.json files make_offsets.py parses. (Validate the exact
+          # invocation on the first workflow_dispatch; swap in cs2-analyzer here
+          # if upstream moves offline support there.)
+          New-Item -ItemType Directory -Force dump | Out-Null
+          Push-Location dumper
+          cargo run --release -- --offline `
+            --client "$env:GITHUB_WORKSPACE\cs2\game\csgo\bin\win64\client.dll" `
+            --engine "$env:GITHUB_WORKSPACE\cs2\game\csgo\bin\win64\engine2.dll" `
+            --output "$env:GITHUB_WORKSPACE\dump"
+          Pop-Location
+
+      - name: Assemble payload
+        if: steps.build.outputs.new != ''
+        run: >
+          python scripts/make_offsets.py
+          --dump-dir dump
+          --steam-buildid ${{ steps.build.outputs.buildid }}
+          --out payload.json
+
+      # 4) Sign (private key = secret, never in the repo).
+      - name: Sign
+        if: steps.build.outputs.new != ''
+        env:
+          OFFSET_SIGNING_KEY: ${{ secrets.OFFSET_SIGNING_KEY }}
+        run: python scripts/sign.py --payload payload.json --out latest.json
+
+      # 5) Publish: commit latest.json + by-build/<build>.json to the repo.
+      - name: Publish to repo
+        if: steps.build.outputs.new != ''
+        shell: pwsh
+        run: |
+          $build = (Get-Content payload.json | ConvertFrom-Json).build
+          New-Item -ItemType Directory -Force offsets/by-build | Out-Null
+          Copy-Item latest.json offsets/latest.json -Force
+          Copy-Item latest.json "offsets/by-build/$build.json" -Force
+          git config user.name  "fumetsu-bot"
+          git config user.email "bot@fumetsu.cc"
+          git add offsets/latest.json "offsets/by-build/$build.json"
+          git commit -m "offsets: build $build (steam ${{ steps.build.outputs.buildid }})"
+          git push
+
+      # 6) Push to fumetsu.cc origin so /data.json serves it. Optional deploy
+      #    hook; if unset, fumetsu.cc pulls offsets/latest.json from the repo.
+      - name: Deploy to fumetsu.cc
+        if: steps.build.outputs.new != '' && env.HOOK != ''
+        env:
+          HOOK: ${{ secrets.FUMETSU_DEPLOY_HOOK }}
+        shell: pwsh
+        run: |
+          Invoke-RestMethod -Method Post -Uri $env:HOOK `
+            -ContentType application/json -InFile latest.json
+
+      # Fail-closed alarm: if we had a new build but produced no latest.json.
+      - name: Open issue on dump failure
+        if: failure() && steps.build.outputs.new != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `offset dump failed for steam build ${{ steps.build.outputs.buildid }}`,
+              body: `The offline dump did not produce a complete, signable payload. No offsets were published. Run logs: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
