@@ -44,17 +44,27 @@ jobs:
       - name: Download CS2 binaries (DepotDownloader, anonymous)
         if: steps.build.outputs.new != ''
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          dotnet tool install --global DepotDownloader
-          $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
-          # CS2 win64 binaries + version file live in depot 2347770.
+          # DepotDownloader ships as a GitHub release zip, not a dotnet tool.
+          gh release download --repo SteamRE/DepotDownloader `
+            --pattern "*windows-x64*.zip" --output dd.zip
+          Expand-Archive dd.zip -DestinationPath dd -Force
+          $dd = (Get-ChildItem dd -Recurse -Filter DepotDownloader.exe |
+                 Select-Object -First 1).FullName
+          if (-not $dd) { throw "DepotDownloader.exe not found in release zip" }
+          # CS2 win64 binaries + version file live in depot 2347770. No -username
+          # => anonymous login (app 730 allows it; no account/ownership needed).
           @'
           regex:game/csgo/bin/win64/client.dll
           regex:game/csgo/bin/win64/engine2.dll
           regex:game/csgo/steam.inf
           '@ | Out-File -Encoding ascii filelist.txt
-          depotdownloader -app 730 -depot 2347770 -filelist filelist.txt `
-            -dir cs2 -username anonymous
+          & $dd -app 730 -depot 2347770 -filelist filelist.txt -dir cs2
+          Write-Host "--- downloaded ---"
+          Get-ChildItem cs2 -Recurse -Include client.dll,engine2.dll,steam.inf |
+            ForEach-Object { Write-Host $_.FullName }
 
       # 3) Offline dump (no running game). cs2-dumper offline analyzer reads the
       #    on-disk DLLs: schema classes + module globals + buttons + info.json.
