@@ -40,53 +40,24 @@ jobs:
         if: steps.build.outputs.new == ''
         run: echo "no new build; nothing to do"
 
-      # 2) Download the DLLs anonymously (app 730 allows anonymous).
-      - name: Download CS2 binaries (DepotDownloader, anonymous)
-        if: steps.build.outputs.new != ''
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # DepotDownloader ships as a GitHub release zip, not a dotnet tool.
-          gh release download --repo SteamRE/DepotDownloader `
-            --pattern "*windows-x64*.zip" --output dd.zip
-          Expand-Archive dd.zip -DestinationPath dd -Force
-          $dd = (Get-ChildItem dd -Recurse -Filter DepotDownloader.exe |
-                 Select-Object -First 1).FullName
-          if (-not $dd) { throw "DepotDownloader.exe not found in release zip" }
-          # CS2 win64 binaries + version file live in depot 2347770. No -username
-          # => anonymous login (app 730 allows it; no account/ownership needed).
-          @'
-          regex:game/csgo/bin/win64/client.dll
-          regex:game/csgo/bin/win64/engine2.dll
-          regex:game/csgo/steam.inf
-          '@ | Out-File -Encoding ascii filelist.txt
-          & $dd -app 730 -depot 2347770 -filelist filelist.txt -dir cs2
-          Write-Host "--- downloaded ---"
-          Get-ChildItem cs2 -Recurse -Include client.dll,engine2.dll,steam.inf |
-            ForEach-Object { Write-Host $_.FullName }
-
-      # 3) Offline dump (no running game). cs2-dumper offline analyzer reads the
-      #    on-disk DLLs: schema classes + module globals + buttons + info.json.
-      #    Fail-closed: make_offsets.py exits non-zero if required offsets are
-      #    missing, so a bad dump is never signed.
-      - name: Dump offsets offline
+      # 2) Pull the freshly-dumped offsets for the new build. a2x/cs2-dumper
+      #    publishes per-build output (offsets.hpp / client_dll.hpp /
+      #    buttons.hpp / info.json) in exactly the format make_offsets.py parses.
+      #    We pull it the moment our depot poller sees a new build - automatic,
+      #    no dev PC. (v2: run our own offline dumper over DepotDownloader-pulled
+      #    DLLs - anonymous depot pull is already proven working in CI.)
+      - name: Fetch offsets dump
         if: steps.build.outputs.new != ''
         shell: pwsh
         run: |
-          git clone --depth 1 https://github.com/a2x/cs2-dumper dumper
-          # Offline/file mode against the downloaded modules -> dump/ with the
-          # .hpp + info.json files make_offsets.py parses. (Validate the exact
-          # invocation on the first workflow_dispatch; swap in cs2-analyzer here
-          # if upstream moves offline support there.)
           New-Item -ItemType Directory -Force dump | Out-Null
-          Push-Location dumper
-          cargo run --release -- --offline `
-            --client "$env:GITHUB_WORKSPACE\cs2\game\csgo\bin\win64\client.dll" `
-            --engine "$env:GITHUB_WORKSPACE\cs2\game\csgo\bin\win64\engine2.dll" `
-            --output "$env:GITHUB_WORKSPACE\dump"
-          Pop-Location
+          $base = "https://raw.githubusercontent.com/a2x/cs2-dumper/main/output"
+          foreach ($f in "offsets.hpp","client_dll.hpp","buttons.hpp","info.json") {
+            Invoke-WebRequest "$base/$f" -OutFile "dump/$f" -UseBasicParsing
+          }
+          Get-ChildItem dump | ForEach-Object { Write-Host $_.Name $_.Length }
 
+      # 3) Assemble (fail-closed: exits non-zero if a required offset is missing).
       - name: Assemble payload
         if: steps.build.outputs.new != ''
         run: >
@@ -95,16 +66,39 @@ jobs:
           --steam-buildid ${{ steps.build.outputs.buildid }}
           --out payload.json
 
+      # Build-gate: never publish a dump whose game build we already published
+      # (prevents re-signing stale offsets if the source hasn't refreshed yet
+      # after a Steam update - the DLL would reject a stale build anyway, but we
+      # don't even publish it).
+      - name: Gate on new build number
+        id: gate
+        if: steps.build.outputs.new != ''
+        shell: pwsh
+        run: |
+          $new = (Get-Content payload.json | ConvertFrom-Json).build
+          $old = 0
+          if (Test-Path offsets/latest.json) {
+            $pub = Get-Content offsets/latest.json | ConvertFrom-Json
+            $old = [int]$pub.build
+          }
+          if ($new -le $old) {
+            Write-Host "source not refreshed yet (build $new <= published $old); skipping"
+            "publish=" | Out-File -Append $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "new build $new (was $old) -> publish"
+            "publish=yes" | Out-File -Append $env:GITHUB_OUTPUT
+          }
+
       # 4) Sign (private key = secret, never in the repo).
       - name: Sign
-        if: steps.build.outputs.new != ''
+        if: steps.gate.outputs.publish == 'yes'
         env:
           OFFSET_SIGNING_KEY: ${{ secrets.OFFSET_SIGNING_KEY }}
         run: python scripts/sign.py --payload payload.json --out latest.json
 
       # 5) Publish: commit latest.json + by-build/<build>.json to the repo.
       - name: Publish to repo
-        if: steps.build.outputs.new != ''
+        if: steps.gate.outputs.publish == 'yes'
         shell: pwsh
         run: |
           $build = (Get-Content payload.json | ConvertFrom-Json).build
@@ -120,7 +114,7 @@ jobs:
       # 6) Push to fumetsu.cc origin so /data.json serves it. Optional deploy
       #    hook; if unset, fumetsu.cc pulls offsets/latest.json from the repo.
       - name: Deploy to fumetsu.cc
-        if: steps.build.outputs.new != '' && env.HOOK != ''
+        if: steps.gate.outputs.publish == 'yes' && env.HOOK != ''
         env:
           HOOK: ${{ secrets.FUMETSU_DEPLOY_HOOK }}
         shell: pwsh
