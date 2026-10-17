@@ -8,6 +8,9 @@ on:
   schedule:
     - cron: "*/10 * * * *"   # every 10 min
   workflow_dispatch: {}       # manual run / first validation
+  push:
+    paths:
+      - .github/workflows/offsets.yml   # run on changes to the pipeline itself
 
 concurrency:
   group: cs2-offsets
